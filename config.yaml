@@ -25,7 +25,7 @@ vision:
   confirmation_frames: 5
 
 engine:
-  path: "stockfish/stockfish"   # Override via --engine flag
+  path: "stockfish"             # Override via --engine flag
   skill_level: 10               # 0 – 20
   move_time: 1.0                # Seconds per move
   threads: 1

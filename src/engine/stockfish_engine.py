@@ -12,6 +12,8 @@ Performance design
 from __future__ import annotations
 
 import logging
+import shutil
+from pathlib import Path
 from typing import Optional
 
 import chess
@@ -44,11 +46,23 @@ class StockfishEngine:
         threads: int = 1,
         hash_mb: int = 16,
     ) -> None:
+        self._sf = None
+        self._move_time_ms = int(move_time * 1000)
+
+        resolved_path = self._resolve_binary_path(path)
+        if resolved_path is None:
+            logger.warning(
+                "Stockfish executable not found (configured path: %s). "
+                "Engine disabled; set engine.path in config.yaml or use --engine.",
+                path,
+            )
+            return
+
         try:
             from stockfish import Stockfish  # type: ignore[import]
 
             self._sf = Stockfish(
-                path=path,
+                path=resolved_path,
                 depth=15,
                 parameters={
                     "Skill Level": skill_level,
@@ -57,11 +71,40 @@ class StockfishEngine:
                     "Minimum Thinking Time": 50,
                 },
             )
-            self._move_time_ms = int(move_time * 1000)
-            logger.info("Stockfish engine started (skill=%d).", skill_level)
+            logger.info(
+                "Stockfish engine started (skill=%d, path=%s).",
+                skill_level,
+                resolved_path,
+            )
         except Exception as exc:
             logger.error("Failed to start Stockfish: %s", exc)
             self._sf = None
+
+    def _resolve_binary_path(self, configured_path: str) -> Optional[str]:
+        configured = Path(configured_path)
+
+        if configured.is_file():
+            return str(configured)
+
+        from_path = shutil.which(configured_path)
+        if from_path:
+            return from_path
+
+        candidates = [
+            Path("stockfish") / "stockfish.exe",
+            Path("stockfish") / "stockfish",
+            Path("engines") / "stockfish.exe",
+            Path("engines") / "stockfish",
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+
+        from_name = shutil.which("stockfish")
+        if from_name:
+            return from_name
+
+        return None
 
     # ------------------------------------------------------------------
     # Public API

@@ -41,7 +41,7 @@ def index_to_square(row: int, col: int) -> str:
 def is_light_square(square: str) -> bool:
     """Check if a square is a light square on the board."""
     row, col = square_to_index(square)
-    return (row + col) % 2 == 1
+    return (row + col) % 2 == 0
 
 
 def uci_to_squares(uci_move: str) -> Tuple[str, str]:

@@ -43,6 +43,7 @@ class BoardState:
 
     def __init__(self) -> None:
         self._grid: np.ndarray = np.zeros(64, dtype=np.int8)
+        self._board = chess.Board()
 
     # ------------------------------------------------------------------
     # Properties
@@ -53,6 +54,22 @@ class BoardState:
         """Read-only view of the occupancy grid."""
         return self._grid.view()
 
+    @property
+    def board(self) -> chess.Board:
+        return self._board
+
+    @property
+    def fen(self) -> str:
+        return self._board.fen()
+
+    @property
+    def turn(self) -> bool:
+        return self._board.turn
+
+    @property
+    def fullmove_number(self) -> int:
+        return self._board.fullmove_number
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -62,6 +79,59 @@ class BoardState:
         if occupancy.shape != (64,):
             raise ValueError(f"Expected shape (64,), got {occupancy.shape}")
         np.copyto(self._grid, occupancy)
+
+    @classmethod
+    def from_fen(cls, fen: str) -> "BoardState":
+        state = cls()
+        state._board = chess.Board(fen)
+        return state
+
+    def get_piece_at(self, square: str) -> Optional[str]:
+        try:
+            sq = chess.parse_square(square)
+        except ValueError:
+            return None
+        piece = self._board.piece_at(sq)
+        return piece.symbol() if piece else None
+
+    def make_move(self, move_uci: str) -> bool:
+        try:
+            move = chess.Move.from_uci(move_uci)
+        except ValueError:
+            return False
+        if move not in self._board.legal_moves:
+            return False
+        self._board.push(move)
+        return True
+
+    def unmake_move(self) -> Optional[str]:
+        if not self._board.move_stack:
+            return None
+        move = self._board.pop()
+        return move.uci()
+
+    def get_legal_moves(self) -> list[str]:
+        return [move.uci() for move in self._board.legal_moves]
+
+    def to_occupancy_grid(self) -> np.ndarray:
+        occupancy = np.zeros((8, 8), dtype=np.int8)
+        for square, piece in self._board.piece_map().items():
+            warp_idx = _PY_TO_WARP[square]
+            row, col = divmod(warp_idx, 8)
+            occupancy[row, col] = 1 if piece.color == chess.WHITE else -1
+        return occupancy
+
+    def is_check(self) -> bool:
+        return self._board.is_check()
+
+    def is_checkmate(self) -> bool:
+        return self._board.is_checkmate()
+
+    def is_stalemate(self) -> bool:
+        return self._board.is_stalemate()
+
+    def is_game_over(self) -> bool:
+        return self._board.is_game_over()
 
     def diff(self, other: "BoardState") -> np.ndarray:
         """Return warp indices where *self* and *other* differ.
@@ -78,6 +148,7 @@ class BoardState:
     def copy(self) -> "BoardState":
         bs = BoardState()
         bs._grid = self._grid.copy()
+        bs._board = self._board.copy(stack=True)
         return bs
 
     @staticmethod

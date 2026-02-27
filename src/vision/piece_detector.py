@@ -14,6 +14,7 @@ Performance design
 from __future__ import annotations
 
 import logging
+from enum import IntEnum
 from typing import Optional
 
 import cv2
@@ -25,6 +26,12 @@ logger = logging.getLogger(__name__)
 
 # Keep only the central 50 % of each square to avoid warp-edge artefacts.
 _CROP_MARGIN = SQUARE_PX // 4  # 25 % margin on each side
+
+
+class SquareState(IntEnum):
+    EMPTY = 0
+    WHITE_PIECE = 1
+    BLACK_PIECE = -1
 
 
 class PieceDetector:
@@ -55,6 +62,8 @@ class PieceDetector:
         self._black_hi = np.array(black_hsv_upper, dtype=np.uint8)
         self._min_fill = min_fill_fraction
         self._crop_area = (SQUARE_PX - 2 * _CROP_MARGIN) ** 2
+        self._piece_presence_threshold = 12.0
+        self._white_black_threshold = 140.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -104,3 +113,46 @@ class PieceDetector:
         inner = blocks[:, m: sq - m, m: sq - m]          # (64, crop, crop)
         # cv2.inRange produces 0 or 255; treat any non-zero pixel as occupied.
         return (inner.reshape(64, -1) > 0).sum(axis=1).astype(np.float32) / self._crop_area
+
+    def set_thresholds(self, piece_presence: float, white_black: float) -> None:
+        self._piece_presence_threshold = float(piece_presence)
+        self._white_black_threshold = float(white_black)
+
+    def classify_square(self, square_bgr: np.ndarray, square_name: str) -> SquareState:
+        gray = cv2.cvtColor(square_bgr, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape[:2]
+        y1, y2 = h // 4, (3 * h) // 4
+        x1, x2 = w // 4, (3 * w) // 4
+        center = gray[y1:y2, x1:x2]
+
+        center_mean = float(np.mean(center))
+        full_mean = float(np.mean(gray))
+        contrast_delta = abs(center_mean - full_mean)
+
+        if contrast_delta < self._piece_presence_threshold:
+            return SquareState.EMPTY
+        if center_mean >= self._white_black_threshold:
+            return SquareState.WHITE_PIECE
+        return SquareState.BLACK_PIECE
+
+    def classify_board(self, squares: dict[str, np.ndarray]) -> np.ndarray:
+        out = np.zeros((8, 8), dtype=np.int8)
+        for square, image in squares.items():
+            file_idx = ord(square[0]) - ord("a")
+            rank_idx = 8 - int(square[1])
+            out[rank_idx, file_idx] = int(self.classify_square(image, square))
+        return out
+
+    def get_detection_debug(self, square_bgr: np.ndarray, square_name: str) -> dict[str, object]:
+        gray = cv2.cvtColor(square_bgr, cv2.COLOR_BGR2GRAY)
+        state = self.classify_square(square_bgr, square_name)
+        file_idx = ord(square_name[0]) - ord("a")
+        rank_idx = int(square_name[1])
+        is_light = (file_idx + rank_idx) % 2 == 0
+        return {
+            "square": square_name,
+            "is_light": is_light,
+            "mean": float(np.mean(gray)),
+            "std": float(np.std(gray)),
+            "classification": state,
+        }

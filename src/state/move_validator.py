@@ -194,7 +194,18 @@ class MoveValidator:
         """
         try:
             chess_move = chess.Move.from_uci(move)
-            return board_state.board.gives_check(chess_move)
+            board = board_state.board.copy(stack=False)
+            piece = board.piece_at(chess_move.from_square)
+            if piece is None:
+                return False
+
+            # Some callers ask about a move even when it's currently the other
+            # side to move; evaluate from the piece side in that case.
+            board.turn = piece.color
+            if chess_move not in board.legal_moves:
+                return False
+
+            return board.gives_check(chess_move)
         except (ValueError, chess.InvalidMoveError):
             return False
     

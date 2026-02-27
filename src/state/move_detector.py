@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
+from dataclasses import dataclass
 from typing import Optional
 
 import chess
@@ -26,6 +27,14 @@ import numpy as np
 from src.state.board_state import BoardState
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class DetectedMove:
+    from_square: str
+    to_square: str
+    uci: str
+    is_castling: bool = False
 
 
 class MoveDetector:
@@ -86,6 +95,59 @@ class MoveDetector:
             self._last_accepted = stable_state.copy()
             self._recent.clear()
         return move
+
+    def get_changed_squares(self, prev: np.ndarray, curr: np.ndarray) -> list[str]:
+        changed: list[str] = []
+        for row, col in np.argwhere(prev != curr):
+            file_char = chr(ord("a") + int(col))
+            rank_char = str(8 - int(row))
+            changed.append(f"{file_char}{rank_char}")
+        return changed
+
+    def detect_move(
+        self,
+        prev: np.ndarray,
+        curr: np.ndarray,
+        chess_board: chess.Board,
+    ) -> Optional[DetectedMove]:
+        if prev.shape != (8, 8) or curr.shape != (8, 8):
+            return None
+
+        def _board_to_occ(board: chess.Board) -> np.ndarray:
+            occ = np.zeros((8, 8), dtype=np.int8)
+            for sq, piece in board.piece_map().items():
+                row = 7 - chess.square_rank(sq)
+                col = chess.square_file(sq)
+                occ[row, col] = 1 if piece.color == chess.WHITE else -1
+            return occ
+
+        for legal_move in chess_board.legal_moves:
+            after_board = chess_board.copy(stack=False)
+            after_board.push(legal_move)
+            if np.array_equal(_board_to_occ(after_board), curr):
+                return DetectedMove(
+                    from_square=chess.square_name(legal_move.from_square),
+                    to_square=chess.square_name(legal_move.to_square),
+                    uci=legal_move.uci(),
+                    is_castling=chess_board.is_castling(legal_move),
+                )
+
+        before = BoardState()
+        before.update(prev.reshape(64).astype(np.int8))
+        after = BoardState()
+        after.update(curr.reshape(64).astype(np.int8))
+
+        changed = before.diff(after)
+        move = self._infer_move(changed, before, after, chess_board)
+        if move is None:
+            return None
+
+        return DetectedMove(
+            from_square=chess.square_name(move.from_square),
+            to_square=chess.square_name(move.to_square),
+            uci=move.uci(),
+            is_castling=chess_board.is_castling(move),
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers

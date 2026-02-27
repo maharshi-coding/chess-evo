@@ -109,12 +109,12 @@ class GameController:
                 continue
 
             warped = self._board_detector.detect(frame)
-            if warped is None:
+            if not warped.found or warped.warped is None:
                 logger.debug("Board not visible – skipping frame.")
                 self._handle_input()
                 continue
 
-            occupancy = self._piece_detector.detect(warped)
+            occupancy = self._piece_detector.detect(warped.warped)
             current_state = BoardState()
             current_state.update(occupancy)
 
@@ -148,8 +148,8 @@ class GameController:
                 time.sleep(0.05)
                 continue
             warped = self._board_detector.detect(frame)
-            if warped is not None:
-                occupancy = self._piece_detector.detect(warped)
+            if warped.found and warped.warped is not None:
+                occupancy = self._piece_detector.detect(warped.warped)
                 self._board_state.update(occupancy)
                 logger.info("Board calibrated.")
                 return

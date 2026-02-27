@@ -14,6 +14,7 @@ Performance design
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional
 
@@ -25,6 +26,14 @@ logger = logging.getLogger(__name__)
 # Board is warped to this resolution for downstream processing.
 WARP_SIZE = 512
 SQUARE_PX = WARP_SIZE // 8  # 64 px per square
+
+
+@dataclass
+class BoardDetectionResult:
+    found: bool
+    corners: Optional[np.ndarray] = None
+    confidence: float = 0.0
+    warped: Optional[np.ndarray] = None
 
 
 def _order_corners(pts: np.ndarray) -> np.ndarray:
@@ -88,20 +97,32 @@ class BoardDetector:
         self._transform = None
         logger.info("BoardDetector cache cleared.")
 
+    def reset_calibration(self) -> None:
+        self.reset()
+
+    def calibrate(self, corners: np.ndarray) -> None:
+        ordered = _order_corners(corners)
+        self._corners = ordered
+        self._transform = self._build_transform(ordered)
+
+    @property
+    def calibrated_corners(self) -> Optional[np.ndarray]:
+        return None if self._corners is None else self._corners.copy()
+
     @property
     def is_calibrated(self) -> bool:
         return self._corners is not None
 
-    def detect(self, frame: np.ndarray) -> Optional[np.ndarray]:
-        """Return a warped (WARP_SIZE × WARP_SIZE) bird's-eye board image.
+    def detect(self, frame: np.ndarray) -> BoardDetectionResult:
+        """Return board detection result including warped bird's-eye image.
 
         Uses cached corners when available; performs detection otherwise.
-        Returns *None* when the board cannot be found.
+        Returns ``BoardDetectionResult(found=False)`` when the board cannot be found.
         """
         if self._transform is None:
             corners = self._find_corners(frame)
             if corners is None:
-                return None
+                return BoardDetectionResult(found=False)
             self._corners = corners
             self._transform = self._build_transform(corners)
 
@@ -111,7 +132,12 @@ class BoardDetector:
             (WARP_SIZE, WARP_SIZE),
             flags=cv2.INTER_LINEAR,
         )
-        return warped
+        return BoardDetectionResult(
+            found=True,
+            corners=None if self._corners is None else self._corners.copy(),
+            confidence=1.0,
+            warped=warped,
+        )
 
     def get_square_image(self, warped: np.ndarray, sq: int) -> np.ndarray:
         """Return the warped image crop for chess square *sq* (0-63)."""
