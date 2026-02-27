@@ -1,262 +1,109 @@
-"""Board state representation."""
+"""Board state representation and occupancy grid management.
+
+Performance design
+------------------
+* Internal state is a compact ``numpy.ndarray`` of shape (64,) with dtype
+  ``int8``.  Comparing two states is a single ``np.array_equal`` call (O(64)
+  C-level loop) rather than 64 Python comparisons.
+* ``diff()`` uses ``np.where(a != b)`` which runs entirely in C and returns a
+  pre-allocated index array.
+* Square-name ↔ index mappings are module-level tuples so they are built once
+  at import time with zero per-call overhead.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Optional
+
 import chess
 import numpy as np
-from typing import Optional, Dict, List, Tuple
-from copy import deepcopy
 
-from src.utils.logging_setup import get_logger
-from src.utils.helpers import square_to_index, index_to_square, get_all_squares
-from src.vision.piece_detector import SquareState
+logger = logging.getLogger(__name__)
 
-logger = get_logger(__name__)
-
-
-# Piece symbols for display
-PIECE_SYMBOLS = {
-    chess.PAWN: 'P',
-    chess.KNIGHT: 'N',
-    chess.BISHOP: 'B',
-    chess.ROOK: 'R',
-    chess.QUEEN: 'Q',
-    chess.KING: 'K'
-}
+# Map python-chess square integers to our row-major warped-board indices.
+# python-chess: A1=0 … H8=63, rank-0 is rank 1 (white's back rank).
+# Our warp: row-0 is the top of the warped image (black's back rank = rank 8).
+# So warp_index = (7 - rank) * 8 + file
+_PY_TO_WARP: tuple[int, ...] = tuple(
+    (7 - chess.square_rank(sq)) * 8 + chess.square_file(sq)
+    for sq in chess.SQUARES
+)
+_WARP_TO_PY: tuple[int, ...] = tuple(
+    chess.square(warp_idx % 8, 7 - warp_idx // 8) for warp_idx in range(64)
+)
 
 
 class BoardState:
-    """Represents the current state of the chess board."""
-    
-    def __init__(self, fen: Optional[str] = None):
-        """Initialize board state.
-        
-        Args:
-            fen: Optional FEN string. If None, uses starting position.
-        """
-        if fen is None:
-            self._board = chess.Board()
-        else:
-            self._board = chess.Board(fen)
-        
-        # Detection state (what the camera sees)
-        self._detection_grid: Optional[np.ndarray] = None
-        
-        # Stability tracking
-        self._stable_frames = 0
-        self._last_detection: Optional[np.ndarray] = None
-    
-    @classmethod
-    def from_fen(cls, fen: str) -> 'BoardState':
-        """Create BoardState from FEN string."""
-        return cls(fen)
-    
-    @classmethod
-    def starting_position(cls) -> 'BoardState':
-        """Create BoardState with starting position."""
-        return cls()
-    
+    """Stores and compares chess board occupancy grids.
+
+    Occupancy values: ``1`` = white piece, ``-1`` = black piece, ``0`` = empty.
+    Indices follow the warp-image row-major order (a8=0, h1=63).
+    """
+
+    def __init__(self) -> None:
+        self._grid: np.ndarray = np.zeros(64, dtype=np.int8)
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
     @property
-    def fen(self) -> str:
-        """Get FEN string of current position."""
-        return self._board.fen()
-    
-    @property
-    def board(self) -> chess.Board:
-        """Get the underlying python-chess Board object."""
-        return self._board
-    
-    def get_piece_at(self, square: str) -> Optional[str]:
-        """Get the piece at a square.
-        
-        Args:
-            square: Square name (e.g., 'e4').
-            
-        Returns:
-            Piece symbol (e.g., 'P', 'n') or None if empty.
+    def grid(self) -> np.ndarray:
+        """Read-only view of the occupancy grid."""
+        return self._grid.view()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def update(self, occupancy: np.ndarray) -> None:
+        """Replace the internal grid with *occupancy* (shape (64,) int8)."""
+        if occupancy.shape != (64,):
+            raise ValueError(f"Expected shape (64,), got {occupancy.shape}")
+        np.copyto(self._grid, occupancy)
+
+    def diff(self, other: "BoardState") -> np.ndarray:
+        """Return warp indices where *self* and *other* differ.
+
+        Uses ``np.where`` for a single C-level scan – O(64) with no Python loop.
         """
-        sq = chess.parse_square(square)
-        piece = self._board.piece_at(sq)
-        return piece.symbol() if piece else None
-    
-    def set_piece_at(self, square: str, piece: Optional[str]) -> None:
-        """Set a piece at a square.
-        
-        Args:
-            square: Square name (e.g., 'e4').
-            piece: Piece symbol (e.g., 'P', 'n') or None to clear.
+        (changed,) = np.where(self._grid != other._grid)
+        return changed
+
+    def equals(self, other: "BoardState") -> bool:
+        """True when both grids are identical."""
+        return bool(np.array_equal(self._grid, other._grid))
+
+    def copy(self) -> "BoardState":
+        bs = BoardState()
+        bs._grid = self._grid.copy()
+        return bs
+
+    @staticmethod
+    def warp_to_chess_sq(warp_idx: int) -> int:
+        """Convert a warp-grid index to a python-chess square integer."""
+        return _WARP_TO_PY[warp_idx]
+
+    @staticmethod
+    def chess_sq_to_warp(chess_sq: int) -> int:
+        """Convert a python-chess square integer to a warp-grid index."""
+        return _PY_TO_WARP[chess_sq]
+
+    def to_chess_board(self) -> chess.Board:
+        """Construct a chess.Board from the current occupancy grid.
+
+        **Note**: Occupancy alone cannot reconstruct piece *types* – this
+        produces a board with generic pawns and is useful only for debugging.
         """
-        sq = chess.parse_square(square)
-        if piece is None:
-            self._board.remove_piece_at(sq)
-        else:
-            self._board.set_piece_at(sq, chess.Piece.from_symbol(piece))
-    
-    def copy(self) -> 'BoardState':
-        """Create a copy of this board state."""
-        new_state = BoardState.__new__(BoardState)
-        new_state._board = self._board.copy()
-        new_state._detection_grid = self._detection_grid.copy() if self._detection_grid is not None else None
-        new_state._stable_frames = self._stable_frames
-        new_state._last_detection = self._last_detection.copy() if self._last_detection is not None else None
-        return new_state
-    
-    def update_from_detection(self, detection_grid: np.ndarray, 
-                             stability_threshold: int = 3) -> bool:
-        """Update state from vision detection.
-        
-        Args:
-            detection_grid: 8x8 array from piece detector.
-            stability_threshold: Number of consistent frames required.
-            
-        Returns:
-            True if state changed (move detected), False otherwise.
-        """
-        if self._last_detection is not None and np.array_equal(detection_grid, self._last_detection):
-            self._stable_frames += 1
-        else:
-            self._stable_frames = 1
-            self._last_detection = detection_grid.copy()
-        
-        if self._stable_frames >= stability_threshold:
-            if self._detection_grid is None or not np.array_equal(detection_grid, self._detection_grid):
-                self._detection_grid = detection_grid.copy()
-                return True
-        
-        return False
-    
-    def get_occupied_squares(self, color: Optional[chess.Color] = None) -> List[str]:
-        """Get list of occupied squares.
-        
-        Args:
-            color: Optional color filter (chess.WHITE or chess.BLACK).
-            
-        Returns:
-            List of square names.
-        """
-        squares = []
-        for sq in chess.SQUARES:
-            piece = self._board.piece_at(sq)
-            if piece is not None:
-                if color is None or piece.color == color:
-                    squares.append(chess.square_name(sq))
-        return squares
-    
-    def get_empty_squares(self) -> List[str]:
-        """Get list of empty squares."""
-        squares = []
-        for sq in chess.SQUARES:
-            if self._board.piece_at(sq) is None:
-                squares.append(chess.square_name(sq))
-        return squares
-    
-    def make_move(self, move: str) -> bool:
-        """Make a move on the board.
-        
-        Args:
-            move: Move in UCI format (e.g., 'e2e4').
-            
-        Returns:
-            True if move was legal and made, False otherwise.
-        """
-        try:
-            chess_move = chess.Move.from_uci(move)
-            if chess_move in self._board.legal_moves:
-                self._board.push(chess_move)
-                return True
-            return False
-        except (ValueError, chess.InvalidMoveError):
-            return False
-    
-    def unmake_move(self) -> Optional[str]:
-        """Unmake the last move.
-        
-        Returns:
-            The move that was undone, or None if no moves to undo.
-        """
-        if len(self._board.move_stack) == 0:
-            return None
-        move = self._board.pop()
-        return move.uci()
-    
-    def is_check(self) -> bool:
-        """Check if current player is in check."""
-        return self._board.is_check()
-    
-    def is_checkmate(self) -> bool:
-        """Check if current player is checkmated."""
-        return self._board.is_checkmate()
-    
-    def is_stalemate(self) -> bool:
-        """Check if game is stalemate."""
-        return self._board.is_stalemate()
-    
-    def is_game_over(self) -> bool:
-        """Check if game is over."""
-        return self._board.is_game_over()
-    
-    @property
-    def turn(self) -> chess.Color:
-        """Get whose turn it is."""
-        return self._board.turn
-    
-    @property
-    def turn_str(self) -> str:
-        """Get turn as string ('white' or 'black')."""
-        return 'white' if self._board.turn == chess.WHITE else 'black'
-    
-    @property
-    def fullmove_number(self) -> int:
-        """Get the full move number."""
-        return self._board.fullmove_number
-    
-    def get_legal_moves(self) -> List[str]:
-        """Get all legal moves in UCI format."""
-        return [move.uci() for move in self._board.legal_moves]
-    
-    def to_grid(self) -> np.ndarray:
-        """Convert board to 8x8 grid representation.
-        
-        Returns:
-            8x8 array where:
-            - Positive values are white pieces (1-6 for P,N,B,R,Q,K)
-            - Negative values are black pieces (-1 to -6)
-            - 0 is empty
-        """
-        grid = np.zeros((8, 8), dtype=np.int8)
-        
-        for sq in chess.SQUARES:
-            piece = self._board.piece_at(sq)
-            if piece is not None:
-                row = 7 - chess.square_rank(sq)
-                col = chess.square_file(sq)
-                value = piece.piece_type
-                if piece.color == chess.BLACK:
-                    value = -value
-                grid[row, col] = value
-        
-        return grid
-    
-    def to_occupancy_grid(self) -> np.ndarray:
-        """Convert board to occupancy grid (like piece detector output).
-        
-        Returns:
-            8x8 array where:
-            - 1 is white piece
-            - -1 is black piece
-            - 0 is empty
-        """
-        grid = np.zeros((8, 8), dtype=np.int8)
-        
-        for sq in chess.SQUARES:
-            piece = self._board.piece_at(sq)
-            if piece is not None:
-                row = 7 - chess.square_rank(sq)
-                col = chess.square_file(sq)
-                grid[row, col] = 1 if piece.color == chess.WHITE else -1
-        
-        return grid
-    
-    def __str__(self) -> str:
-        """String representation of the board."""
-        return str(self._board)
-    
-    def __repr__(self) -> str:
-        return f"BoardState(fen='{self.fen}')"
+        board = chess.Board(fen=None)
+        for warp_idx, occ in enumerate(self._grid):
+            if occ == 0:
+                continue
+            sq = _WARP_TO_PY[warp_idx]
+            color = chess.WHITE if occ > 0 else chess.BLACK
+            board.set_piece_at(sq, chess.Piece(chess.PAWN, color))
+        return board
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"BoardState(non_empty={int(np.count_nonzero(self._grid))})"

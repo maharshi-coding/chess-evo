@@ -1,0 +1,27 @@
+# Python byte-compiled / optimised / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+
+# pytest cache
+.pytest_cache/
+
+# Logs
+*.log
+
+# Editor settings
+.vscode/
+.idea/
+
+# Stockfish binary (not part of source)
+stockfish/

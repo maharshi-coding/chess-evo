@@ -1,237 +1,183 @@
-"""Board detection using computer vision techniques."""
+"""Chessboard corner and square detection.
+
+Performance design
+------------------
+* Board corners are expensive to compute (contour analysis, perspective
+  transform), so they are **cached** once detected and only recomputed on
+  explicit ``reset()``.
+* The 64 square ROI bounding boxes are pre-computed as a (64, 4) numpy array
+  the first time the board is warped, enabling vectorised slicing later.
+* The warp transform matrix is stored so applying it to new frames is a single
+  ``cv2.warpPerspective`` call rather than recomputing it each time.
+"""
+
+from __future__ import annotations
+
+import logging
+from functools import lru_cache
+from typing import Optional
+
 import cv2
 import numpy as np
-from typing import Optional, Tuple, List
-from dataclasses import dataclass
 
-from src.config import config
-from src.utils.logging_setup import get_logger
-from src.utils.helpers import order_points
+logger = logging.getLogger(__name__)
 
-logger = get_logger(__name__)
+# Board is warped to this resolution for downstream processing.
+WARP_SIZE = 512
+SQUARE_PX = WARP_SIZE // 8  # 64 px per square
 
 
-@dataclass
-class BoardDetectionResult:
-    """Result of board detection."""
-    found: bool
-    corners: Optional[np.ndarray] = None  # 4 corners in order: TL, TR, BR, BL
-    confidence: float = 0.0
-    debug_image: Optional[np.ndarray] = None
+def _order_corners(pts: np.ndarray) -> np.ndarray:
+    """Return the four corner points in (TL, TR, BR, BL) order."""
+    pts = pts.reshape(4, 2).astype(np.float32)
+    s = pts.sum(axis=1)
+    d = np.diff(pts, axis=1).ravel()
+    return np.array(
+        [pts[np.argmin(s)], pts[np.argmin(d)], pts[np.argmax(s)], pts[np.argmax(d)]],
+        dtype=np.float32,
+    )
+
+
+@lru_cache(maxsize=1)
+def _square_rois() -> np.ndarray:
+    """Return a (64, 4) array of (x1, y1, x2, y2) ROIs for each square.
+
+    Indexed row-major from a8 (index 0) to h1 (index 63), consistent with
+    python-chess ``chess.A8 == 56`` when converted by ``_sq_index()``.
+    Cached so it is built only once per process.
+    """
+    rois = np.empty((64, 4), dtype=np.int32)
+    for rank in range(8):
+        for file in range(8):
+            sq = rank * 8 + file
+            x1 = file * SQUARE_PX
+            y1 = rank * SQUARE_PX
+            rois[sq] = [x1, y1, x1 + SQUARE_PX, y1 + SQUARE_PX]
+    return rois
 
 
 class BoardDetector:
-    """Detects chessboard in camera frames."""
-    
-    def __init__(self):
-        """Initialize the board detector."""
-        vision_config = config.vision.get('board_detection', {})
-        self.method = vision_config.get('method', 'contour')
-        self.min_board_area = vision_config.get('min_board_area', 50000)
-        self.canny_threshold1 = vision_config.get('canny_threshold1', 50)
-        self.canny_threshold2 = vision_config.get('canny_threshold2', 150)
-        
-        # Calibrated corners (set by calibration routine)
-        self._calibrated_corners: Optional[np.ndarray] = None
-        self._is_calibrated = False
-        
-    def detect(self, frame: np.ndarray, debug: bool = False) -> BoardDetectionResult:
-        """Detect chessboard in the given frame.
-        
-        Args:
-            frame: BGR image from camera.
-            debug: If True, include debug visualization in result.
-            
-        Returns:
-            BoardDetectionResult with corner positions if found.
-        """
-        if self._is_calibrated and self._calibrated_corners is not None:
-            # Use calibrated corners directly
-            return BoardDetectionResult(
-                found=True,
-                corners=self._calibrated_corners.copy(),
-                confidence=1.0
-            )
-        
-        if self.method == 'contour':
-            return self._detect_by_contour(frame, debug)
-        elif self.method == 'checkerboard':
-            return self._detect_checkerboard(frame, debug)
-        else:
-            logger.error(f"Unknown detection method: {self.method}")
-            return BoardDetectionResult(found=False)
-    
-    def _detect_by_contour(self, frame: np.ndarray, debug: bool = False) -> BoardDetectionResult:
-        """Detect board by finding the largest quadrilateral contour."""
-        debug_image = frame.copy() if debug else None
-        
-        # Convert to grayscale
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Apply Gaussian blur to reduce noise
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        # Edge detection
-        edges = cv2.Canny(blurred, self.canny_threshold1, self.canny_threshold2)
-        
-        # Dilate to connect edges
-        kernel = np.ones((3, 3), np.uint8)
-        edges = cv2.dilate(edges, kernel, iterations=2)
-        
-        # Find contours
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if not contours:
-            logger.debug("No contours found")
-            return BoardDetectionResult(found=False, debug_image=debug_image)
-        
-        # Sort contours by area (largest first)
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)
-        
-        for contour in contours[:5]:  # Check top 5 largest contours
-            area = cv2.contourArea(contour)
-            
-            if area < self.min_board_area:
-                continue
-            
-            # Approximate polygon
-            peri = cv2.arcLength(contour, True)
-            approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
-            
-            # Check if it's a quadrilateral
-            if len(approx) == 4:
-                corners = approx.reshape(4, 2).astype(np.float32)
-                ordered_corners = order_points(corners)
-                
-                # Calculate confidence based on how square-like the shape is
-                confidence = self._calculate_board_confidence(ordered_corners)
-                
-                if debug and debug_image is not None:
-                    cv2.drawContours(debug_image, [approx], -1, (0, 255, 0), 3)
-                    for i, corner in enumerate(ordered_corners):
-                        cv2.circle(debug_image, tuple(corner.astype(int)), 10, (0, 0, 255), -1)
-                        cv2.putText(debug_image, str(i), tuple(corner.astype(int)),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-                
-                logger.debug(f"Board detected with confidence {confidence:.2f}")
-                return BoardDetectionResult(
-                    found=True,
-                    corners=ordered_corners,
-                    confidence=confidence,
-                    debug_image=debug_image
-                )
-        
-        logger.debug("No valid quadrilateral found")
-        return BoardDetectionResult(found=False, debug_image=debug_image)
-    
-    def _detect_checkerboard(self, frame: np.ndarray, debug: bool = False) -> BoardDetectionResult:
-        """Detect board using OpenCV's checkerboard pattern detection."""
-        debug_image = frame.copy() if debug else None
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Try to find inner corners (7x7 for 8x8 board)
-        pattern_size = (7, 7)
-        flags = cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
-        
-        ret, corners = cv2.findChessboardCorners(gray, pattern_size, flags)
-        
-        if ret:
-            # Refine corner positions
-            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-            corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
-            
-            # Get outer corners of the board
-            inner_corners = corners.reshape(7, 7, 2)
-            
-            # Extrapolate to get board corners
-            # This is an approximation - assumes regular grid
-            top_left = self._extrapolate_corner(inner_corners[0, 0], inner_corners[0, 1], inner_corners[1, 0])
-            top_right = self._extrapolate_corner(inner_corners[0, 6], inner_corners[0, 5], inner_corners[1, 6])
-            bottom_right = self._extrapolate_corner(inner_corners[6, 6], inner_corners[6, 5], inner_corners[5, 6])
-            bottom_left = self._extrapolate_corner(inner_corners[6, 0], inner_corners[6, 1], inner_corners[5, 0])
-            
-            board_corners = np.array([top_left, top_right, bottom_right, bottom_left], dtype=np.float32)
-            
-            if debug and debug_image is not None:
-                cv2.drawChessboardCorners(debug_image, pattern_size, corners, ret)
-                for corner in board_corners:
-                    cv2.circle(debug_image, tuple(corner.astype(int)), 10, (0, 0, 255), -1)
-            
-            return BoardDetectionResult(
-                found=True,
-                corners=board_corners,
-                confidence=0.95,
-                debug_image=debug_image
-            )
-        
-        return BoardDetectionResult(found=False, debug_image=debug_image)
-    
-    def _extrapolate_corner(self, corner: np.ndarray, adj1: np.ndarray, adj2: np.ndarray) -> np.ndarray:
-        """Extrapolate outer corner from inner corners."""
-        # Vector from adjacent corners to the corner
-        v1 = corner - adj1
-        v2 = corner - adj2
-        # Extrapolate by adding both vectors
-        return corner + v1 + v2
-    
-    def _calculate_board_confidence(self, corners: np.ndarray) -> float:
-        """Calculate confidence score based on shape regularity."""
-        # Calculate side lengths
-        sides = []
-        for i in range(4):
-            p1 = corners[i]
-            p2 = corners[(i + 1) % 4]
-            sides.append(np.linalg.norm(p2 - p1))
-        
-        # Check aspect ratio (should be close to 1:1)
-        avg_side = np.mean(sides)
-        side_variance = np.std(sides) / avg_side if avg_side > 0 else 1.0
-        
-        # Calculate angles (should be close to 90 degrees)
-        angles = []
-        for i in range(4):
-            p1 = corners[(i - 1) % 4]
-            p2 = corners[i]
-            p3 = corners[(i + 1) % 4]
-            
-            v1 = p1 - p2
-            v2 = p3 - p2
-            
-            cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
-            angle = np.arccos(np.clip(cos_angle, -1, 1))
-            angles.append(np.abs(angle - np.pi/2))
-        
-        angle_error = np.mean(angles)
-        
-        # Combine metrics
-        confidence = max(0, 1.0 - side_variance - angle_error)
-        return confidence
-    
-    def calibrate(self, corners: np.ndarray) -> None:
-        """Set calibrated corners manually.
-        
-        Args:
-            corners: 4 corner points in order (TL, TR, BR, BL).
-        """
-        if corners.shape != (4, 2):
-            raise ValueError("Corners must be shape (4, 2)")
-        
-        self._calibrated_corners = order_points(corners.astype(np.float32))
-        self._is_calibrated = True
-        logger.info("Board calibration set")
-    
-    def reset_calibration(self) -> None:
-        """Reset calibration to use automatic detection."""
-        self._calibrated_corners = None
-        self._is_calibrated = False
-        logger.info("Board calibration reset")
-    
+    """Detect and warp the chessboard from a camera frame.
+
+    Parameters
+    ----------
+    min_area_fraction, max_area_fraction:
+        The board contour must cover between these fractions of the full
+        frame area to be accepted.
+    """
+
+    def __init__(
+        self,
+        min_area_fraction: float = 0.10,
+        max_area_fraction: float = 0.95,
+    ) -> None:
+        self._min_frac = min_area_fraction
+        self._max_frac = max_area_fraction
+
+        # Cached state – reset when calibrating.
+        self._corners: Optional[np.ndarray] = None   # shape (4, 2), float32
+        self._transform: Optional[np.ndarray] = None  # 3x3 homography matrix
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def reset(self) -> None:
+        """Invalidate cached corners, forcing re-detection on next call."""
+        self._corners = None
+        self._transform = None
+        logger.info("BoardDetector cache cleared.")
+
     @property
     def is_calibrated(self) -> bool:
-        """Check if board is calibrated."""
-        return self._is_calibrated
-    
-    @property
-    def calibrated_corners(self) -> Optional[np.ndarray]:
-        """Get calibrated corners if available."""
-        return self._calibrated_corners.copy() if self._calibrated_corners is not None else None
+        return self._corners is not None
+
+    def detect(self, frame: np.ndarray) -> Optional[np.ndarray]:
+        """Return a warped (WARP_SIZE × WARP_SIZE) bird's-eye board image.
+
+        Uses cached corners when available; performs detection otherwise.
+        Returns *None* when the board cannot be found.
+        """
+        if self._transform is None:
+            corners = self._find_corners(frame)
+            if corners is None:
+                return None
+            self._corners = corners
+            self._transform = self._build_transform(corners)
+
+        warped: np.ndarray = cv2.warpPerspective(
+            frame,
+            self._transform,
+            (WARP_SIZE, WARP_SIZE),
+            flags=cv2.INTER_LINEAR,
+        )
+        return warped
+
+    def get_square_image(self, warped: np.ndarray, sq: int) -> np.ndarray:
+        """Return the warped image crop for chess square *sq* (0-63)."""
+        rois = _square_rois()
+        x1, y1, x2, y2 = rois[sq]
+        return warped[y1:y2, x1:x2]
+
+    # ------------------------------------------------------------------
+    # Corner detection helpers
+    # ------------------------------------------------------------------
+
+    def _find_corners(self, frame: np.ndarray) -> Optional[np.ndarray]:
+        """Locate the four chessboard corners using contour analysis."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Adaptive threshold handles varying illumination.
+        binary = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+        )
+        binary = cv2.bitwise_not(binary)
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        contours, _ = cv2.findContours(
+            closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not contours:
+            logger.debug("No contours found during board detection.")
+            return None
+
+        frame_area = frame.shape[0] * frame.shape[1]
+        min_area = self._min_frac * frame_area
+        max_area = self._max_frac * frame_area
+
+        best: Optional[np.ndarray] = None
+        best_area = 0.0
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < min_area or area > max_area:
+                continue
+            peri = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+            if len(approx) == 4 and area > best_area:
+                best = approx
+                best_area = area
+
+        if best is None:
+            logger.debug("No quadrilateral board contour found.")
+            return None
+
+        corners = _order_corners(best)
+        logger.info("Board corners detected (area=%.0f px²).", best_area)
+        return corners
+
+    @staticmethod
+    def _build_transform(corners: np.ndarray) -> np.ndarray:
+        """Compute the perspective transform from *corners* to a square warp."""
+        dst = np.array(
+            [
+                [0, 0],
+                [WARP_SIZE - 1, 0],
+                [WARP_SIZE - 1, WARP_SIZE - 1],
+                [0, WARP_SIZE - 1],
+            ],
+            dtype=np.float32,
+        )
+        return cv2.getPerspectiveTransform(corners, dst)
