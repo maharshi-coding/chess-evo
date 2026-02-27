@@ -1,0 +1,1 @@
+"""Theatre (visual display) package."""

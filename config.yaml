@@ -1,0 +1,41 @@
+camera:
+  device_id: 0
+  width: 1280
+  height: 720
+  fps: 30
+  # Number of camera frames to skip between processing cycles.
+  # Higher values reduce CPU load at the cost of responsiveness.
+  process_every_n_frames: 3
+
+vision:
+  board_detection:
+    method: "contour"           # Detection method: "contour" | "hough"
+    min_area_fraction: 0.1      # Board must cover at least 10 % of frame
+    max_area_fraction: 0.95
+  piece_detection:
+    method: "color"             # Color-based detection
+    # HSV ranges for white / black pieces (H, S, V each as [low, high])
+    white_hsv_lower: [0, 0, 180]
+    white_hsv_upper: [180, 60, 255]
+    black_hsv_lower: [0, 0, 0]
+    black_hsv_upper: [180, 255, 80]
+  # Pixel change threshold per square to consider it "changed"
+  change_threshold: 0.08
+  # Frames that must agree before a move is confirmed
+  confirmation_frames: 5
+
+engine:
+  path: "stockfish/stockfish"   # Override via --engine flag
+  skill_level: 10               # 0 – 20
+  move_time: 1.0                # Seconds per move
+  threads: 1
+  hash_mb: 16
+
+theatre:
+  window_size: 800
+  board_size: 640
+  fps: 30
+
+logging:
+  level: "INFO"
+  file: null                    # Set to a path string to log to a file
