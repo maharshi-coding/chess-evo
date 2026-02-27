@@ -1,0 +1,44 @@
+camera:
+  device_id: 0
+  width: 1280
+  height: 720
+  fps: 30
+
+vision:
+  board_detection:
+    method: "contour"
+    min_board_area: 50000
+    canny_threshold1: 50
+    canny_threshold2: 150
+  
+  piece_detection:
+    method: "color"
+    empty_threshold: 0.3
+    white_threshold: 0.6
+    sample_size: 30
+
+engine:
+  path: "stockfish/stockfish.exe"
+  skill_level: 10
+  move_time: 1.0
+  depth: 15
+
+theatre:
+  window_size: 800
+  board_size: 640
+  colors:
+    light_square: [238, 238, 210]
+    dark_square: [118, 150, 86]
+    highlight: [255, 255, 0, 128]
+    last_move: [255, 255, 0, 100]
+    ai_move: [100, 255, 100, 150]
+
+game:
+  player_color: "white"
+  confirm_moves: true
+  stability_frames: 5
+
+logging:
+  level: "INFO"
+  save_frames: false
+  frame_directory: "logs/frames"
